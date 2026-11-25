@@ -31,6 +31,11 @@ import java.net.URLEncoder
 import java.util.Locale
 import kotlin.coroutines.resume
 
+/** The cards a page shows below the current weather, in their default order. */
+enum class Card(val title: String) {
+    RAIN("Rain soon"), HOURLY("Hourly"), DAILY("Daily"), RADAR("Radar"), AIR("Air quality"), DETAILS("Details"), SUN("Sun and moon")
+}
+
 /** Places, settings and forecasts (memory, then a JSON file per place, then Open-Meteo). */
 class Repo(private val app: Context) {
     private val prefs = app.getSharedPreferences("skyform", Context.MODE_PRIVATE)
@@ -39,6 +44,18 @@ class Repo(private val app: Context) {
     val units = MutableStateFlow(loadUnits())
     val widgetAlpha = MutableStateFlow(prefs.getFloat("widget_alpha", 0.6f))
     val checkUpdates = MutableStateFlow(prefs.getBoolean("check_updates", true))
+    /** The sky moves (it always holds still in battery saver and after a while without a touch). */
+    val skyMotion = MutableStateFlow(prefs.getBoolean("sky_motion", true))
+    /** Open-Meteo's model ([OpenMeteo.models]). */
+    val model = MutableStateFlow(prefs.getString("model", "best_match") ?: "best_match")
+    /** The cards below the current weather, in order, each on or off. */
+    val cards = MutableStateFlow(loadCards())
+    /** Notifications: the temperature in the status bar, NWS alerts, rain about to start, a summary at [dailyAt] (minutes after midnight). */
+    val notifyNow = MutableStateFlow(prefs.getBoolean("notify_now", false))
+    val notifyAlerts = MutableStateFlow(prefs.getBoolean("notify_alerts", false))
+    val notifyRain = MutableStateFlow(prefs.getBoolean("notify_rain", false))
+    val notifyDaily = MutableStateFlow(prefs.getBoolean("notify_daily", false))
+    val dailyAt = MutableStateFlow(prefs.getInt("daily_at", 7 * 60))
     val forecasts = MutableStateFlow<Map<String, Forecast>>(emptyMap())
     val busy = MutableStateFlow<Set<String>>(emptySet())
     val errors = MutableStateFlow<Map<String, String>>(emptyMap())
@@ -54,7 +71,7 @@ class Repo(private val app: Context) {
         val widgetPlaceChanged = list.firstOrNull() != places.value.firstOrNull()
         places.value = list
         prefs.edit().putString("places", JSONArray(list.map { it.toJson() }).toString()).apply()
-        if (widgetPlaceChanged) Widget.updateAll(app)
+        if (widgetPlaceChanged) { Widget.updateAll(app); Notify.refresh(app) }
     }
 
     /** The phone's location goes first; other places at the end. */
@@ -81,16 +98,62 @@ class Repo(private val app: Context) {
 
     private fun loadUnits(): Units {
         val d = Units.default(DateFormat.is24HourFormat(app))
+        val inches = prefs.getBoolean("inches", d.inches)
         return Units(prefs.getBoolean("fahrenheit", d.fahrenheit), prefs.getString("wind", d.wind) ?: d.wind,
-            prefs.getBoolean("clock24", d.clock24), prefs.getBoolean("inches", d.inches))
+            prefs.getBoolean("clock24", d.clock24), inches, prefs.getString("pressure", null) ?: if (inches) "inhg" else "hpa")
     }
 
     fun setUnits(u: Units) {
         units.value = u
         prefs.edit().putBoolean("fahrenheit", u.fahrenheit).putString("wind", u.wind).putBoolean("clock24", u.clock24)
-            .putBoolean("inches", u.inches).apply()
+            .putBoolean("inches", u.inches).putString("pressure", u.pressureUnit).apply()
         Widget.updateAll(app)
+        Notify.refresh(app)
     }
+
+    private fun loadCards(): List<Pair<Card, Boolean>> {
+        val off = prefs.getStringSet("cards_off", emptySet()).orEmpty()
+        val saved = prefs.getString("card_order", "").orEmpty().split(",").mapNotNull { n -> Card.entries.firstOrNull { it.name == n } }
+        return (saved + Card.entries.filter { it !in saved }).map { it to (it.name !in off) }
+    }
+
+    fun setCards(list: List<Pair<Card, Boolean>>) {
+        cards.value = list
+        prefs.edit().putString("card_order", list.joinToString(",") { it.first.name })
+            .putStringSet("cards_off", list.filter { !it.second }.map { it.first.name }.toSet()).apply()
+    }
+
+    fun setSkyMotion(on: Boolean) {
+        skyMotion.value = on
+        prefs.edit().putBoolean("sky_motion", on).apply()
+    }
+
+    fun setModel(m: String) {
+        model.value = m
+        prefs.edit().putString("model", m).apply()
+    }
+
+    /** Saves a notification setting ("notify_now", ...) and starts or stops the background job to match. */
+    fun setNotify(key: String, on: Boolean) {
+        when (key) {
+            "notify_now" -> notifyNow.value = on
+            "notify_alerts" -> notifyAlerts.value = on
+            "notify_rain" -> notifyRain.value = on
+            "notify_daily" -> notifyDaily.value = on
+        }
+        prefs.edit().putBoolean(key, on).apply()
+        RefreshJob.sync(app)
+        Notify.refresh(app)
+    }
+
+    fun setDailyAt(minutes: Int) {
+        dailyAt.value = minutes
+        prefs.edit().putInt("daily_at", minutes).apply()
+    }
+
+    /** Small notes the notifications keep (which alerts were shown, when rain was last announced). */
+    fun note(key: String): String = prefs.getString("n_$key", "").orEmpty()
+    fun setNote(key: String, value: String) = prefs.edit().putString("n_$key", value).apply()
 
     fun setWidgetAlpha(a: Float) {
         widgetAlpha.value = a
@@ -124,8 +187,9 @@ class Repo(private val app: Context) {
             nws != null && om != null -> Nws.fill(nws, om)
             else -> nws ?: om ?: throw IOException("no forecast in the documents")
         }
+        val air = docs.optString("aq").takeIf { it.isNotEmpty() }?.let { runCatching { OpenMeteo.parseAir(it) }.getOrNull() }
         // a day without a high or a low (the NWS alone, late in the evening) would break the range bars
-        return Forecast(f.fetchedAt, f.offset, f.current, f.hours, f.days.filter { !it.max.isNaN() && !it.min.isNaN() }, f.alerts, f.source)
+        return f.with(days = f.days.filter { !it.max.isNaN() && !it.min.isNaN() }, air = air)
     }
 
     /** What is known about [id] without asking the network. */
@@ -133,12 +197,18 @@ class Repo(private val app: Context) {
         runCatching { parse(JSONObject(f.readText()), f.lastModified()) }.getOrNull()
     }?.also { fc -> forecasts.update { it + (id to fc) } }
 
-    /** Open-Meteo always (it fills the NWS's gaps), the NWS too when it is the source; at least one must answer. */
+    /**
+     * Open-Meteo always (it fills the NWS's gaps), the NWS too when it is the source; at least one must answer. Air
+     * quality when it comes.
+     */
     private suspend fun fetch(p: Place): JSONObject = coroutineScope {
-        val om = async { runCatching { String(UrlHttp.get(OpenMeteo.url(p.lat, p.lon), 4 shl 20, "application/json"), Charsets.UTF_8) }.getOrNull() }
+        fun get(url: String) = String(UrlHttp.get(url, 4 shl 20, "application/json"), Charsets.UTF_8)
+        val om = async { runCatching { get(OpenMeteo.url(p.lat, p.lon, model.value)) }.getOrNull() }
+        val aq = async { runCatching { get(OpenMeteo.airUrl(p.lat, p.lon)) }.getOrNull() }
         val nws = if (source.value == "nws") async { runCatching { Nws.fetch(p.lat, p.lon) }.getOrNull() } else null
         JSONObject().apply {
             om.await()?.let { put("om", it) }
+            aq.await()?.let { put("aq", it) }
             nws?.await()?.forEach { (k, v) -> put(k, v) }
             if (!has("om") && !has("hourly")) throw IOException("no weather service answered")
         }
@@ -158,6 +228,7 @@ class Repo(private val app: Context) {
             cacheFile(p.id).apply { parentFile?.mkdirs(); writeText(docs.toString()) }
             forecasts.update { it + (p.id to fc) }
             errors.update { it - p.id }
+            if (places.value.firstOrNull()?.id == p.id) Notify.onForecast(app, p, fc)
             fc
         } catch (e: Exception) {
             errors.update { it + (p.id to "Can't reach the weather service") }

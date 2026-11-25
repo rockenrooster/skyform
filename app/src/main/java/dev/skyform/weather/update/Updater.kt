@@ -179,7 +179,8 @@ object UrlHttp : UpdateHttp {
             connectTimeout = 8000
             readTimeout = 8000
             instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "Skyform/1.0 (Android weather app)")
+            useCaches = false   // forecasts and updates are always fresh (the HTTP cache is for map tiles)
+            setRequestProperty("User-Agent", "Skyform/1.0 (Android weather app; https://github.com/rockenrooster/skyform)")
             setRequestProperty("Accept", accept)
         }
 

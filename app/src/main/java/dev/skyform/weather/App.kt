@@ -2,6 +2,7 @@ package dev.skyform.weather
 
 import android.app.Application
 import android.content.Context
+import android.net.http.HttpResponseCache
 import android.graphics.Color
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -15,10 +16,20 @@ import dev.skyform.weather.update.UrlHttp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.io.File
 
 class App : Application() {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    override fun onCreate() {
+        super.onCreate()
+        scope.launch {
+            // Map and radar tiles, kept as long as their servers allow (forecast requests turn the cache off)
+            runCatching { HttpResponseCache.install(File(cacheDir, "http"), 16L shl 20) }
+            RefreshJob.sync(this@App)
+        }
+    }
     val repo by lazy { Repo(this) }
     val updater by lazy {
         Updater(BuildConfig.BUILD_NUMBER, BuildConfig.REPO, File(cacheDir, "updates"), UrlHttp,

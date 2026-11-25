@@ -59,7 +59,7 @@ object Nws {
         val hours = periods.map { p ->
             Hour(epoch(p.getString("startTime")), temp(p), p.v("relativeHumidity").r(), p.v("probabilityOfPrecipitation").r(),
                 code(p.str("icon")), p.optBoolean("isDaytime", true), Double.NaN, Double.NaN, p.v("dewpoint"),
-                wind(p.str("windSpeed")), 0.0)
+                wind(p.str("windSpeed")), 0.0, windDir = degrees(p.str("windDirection")))
         }
 
         // 12-hour periods: each date's day period gives the high, the night after it the low (as the NWS pairs them)
@@ -73,8 +73,11 @@ object Nws {
                 val start = date.atStartOfDay().toEpochSecond(off)
                 val own = hours.filter { it.time in start until start + 86400 }
                 val main = day ?: night!!
-                Day(start, code(main.str("icon")), day?.let(::temp) ?: own.maxOfOrNull { it.temp } ?: Double.NaN,
-                    night?.let(::temp) ?: own.minOfOrNull { it.temp } ?: Double.NaN, ps.maxOf { it.v("probabilityOfPrecipitation").r() },
+                // the high and low take in the date's own hours too: after midnight, the night ahead is not today's low
+                fun pick(a: Double, b: Double, f: (Double, Double) -> Double) = if (a.isNaN()) b else if (b.isNaN()) a else f(a, b)
+                Day(start, code(main.str("icon")), pick(day?.let(::temp) ?: Double.NaN, own.maxOfOrNull { it.temp } ?: Double.NaN, ::maxOf),
+                    pick(night?.let(::temp) ?: Double.NaN, own.minOfOrNull { it.temp } ?: Double.NaN, ::minOf),
+                    ps.maxOf { it.v("probabilityOfPrecipitation").r() },
                     0.0, 0, 0, Double.NaN, ps.maxOf { wind(it.str("windSpeed")) }, main.str("shortForecast"),
                     ps.joinToString("\n\n") { "${it.str("name")}: ${it.str("detailedForecast")}" })
             }
@@ -88,12 +91,12 @@ object Nws {
             Current(epoch(obs.getString("timestamp")), t, obs.v("windChill").or(obs.v("heatIndex")).or(t),
                 obs.v("relativeHumidity").takeIf { !it.isNaN() }?.roundToInt() ?: first.humidity,
                 obs.str("icon").let { if (it.isEmpty()) first.code else code(it) }, first.isDay, obs.v("windSpeed").or(0.0),
-                obs.v("windDirection").takeIf { !it.isNaN() }?.roundToInt() ?: compass(periods[0].str("windDirection")),
+                obs.v("windDirection").takeIf { !it.isNaN() }?.roundToInt() ?: degrees(periods[0].str("windDirection")),
                 obs.v("windGust"), obs.v("seaLevelPressure").or(obs.v("barometricPressure")) / 100, 0.0,
                 obs.str("textDescription").ifEmpty { periods[0].str("shortForecast") })
         } else {
             Current(first.time, first.temp, Double.NaN, first.humidity, first.code, first.isDay, first.wind,
-                compass(periods[0].str("windDirection")), Double.NaN, Double.NaN, 0.0, periods[0].str("shortForecast"))
+                degrees(periods[0].str("windDirection")), Double.NaN, Double.NaN, 0.0, periods[0].str("shortForecast"))
         }
 
         val severity = listOf("Extreme", "Severe", "Moderate", "Minor")
@@ -107,20 +110,34 @@ object Nws {
         return Forecast(fetchedAt, offset, current, hours, days, alerts, "nws")
     }
 
-    /** The NWS forecast with Open-Meteo's UV, visibility, rain amounts, sun times and days 8-14 added. */
+    /**
+     * The NWS forecast with Open-Meteo's UV, visibility, rain and snow amounts, feels-like, clouds, pressure, gusts,
+     * sun times, 15-minute precipitation, yesterday's hours (comparisons) and the hours and days after the NWS's last.
+     */
     fun fill(n: Forecast, om: Forecast): Forecast {
         val oh = om.hours.associateBy { it.time }
-        val hours = n.hours.map { h -> oh[h.time]?.let { o -> h.copy(uv = o.uv, visibility = o.visibility, precip = o.precip, isDay = o.isDay) } ?: h }
+        val hours = n.hours.map { h ->
+            oh[h.time]?.let { o ->
+                h.copy(uv = o.uv, visibility = o.visibility, precip = o.precip, isDay = o.isDay, feels = o.feels, cloud = o.cloud,
+                    pressure = o.pressure, gust = o.gust, snow = o.snow, windDir = if (h.windDir >= 0) h.windDir else o.windDir)
+            } ?: h
+        }
+        val first = n.hours.firstOrNull()?.time ?: Long.MAX_VALUE
+        val lastHour = n.hours.lastOrNull()?.time ?: Long.MIN_VALUE
         val od = om.days.associateBy { it.time }
         val last = n.days.lastOrNull()?.time ?: Long.MIN_VALUE
         val days = n.days.map { d ->
-            od[d.time]?.let { o -> d.copy(precip = o.precip, sunrise = o.sunrise, sunset = o.sunset, uv = o.uv, max = d.max.or(o.max), min = d.min.or(o.min)) } ?: d
+            od[d.time]?.let { o ->
+                d.copy(precip = o.precip, sunrise = o.sunrise, sunset = o.sunset, uv = o.uv, max = d.max.or(o.max), min = d.min.or(o.min),
+                    gust = o.gust, windDir = o.windDir, snow = o.snow, sunshine = o.sunshine, precipHours = o.precipHours)
+            } ?: d
         } + om.days.filter { it.time > last }
         val c = n.current.let { c ->
             c.copy(feels = c.feels.or(om.current.feels), gust = c.gust.or(om.current.gust), pressure = c.pressure.or(om.current.pressure),
-                precip = om.current.precip, isDay = om.current.isDay)
+                precip = om.current.precip, isDay = om.current.isDay, cloud = om.current.cloud)
         }
-        return Forecast(n.fetchedAt, n.offset, c, hours, days, n.alerts, n.source)
+        return Forecast(n.fetchedAt, n.offset, c, om.hours.filter { it.time < first } + hours + om.hours.filter { it.time > lastHour },
+            om.days.filter { it.time < (n.days.firstOrNull()?.time ?: Long.MIN_VALUE) } + days, n.alerts, n.source, om.quarters)
     }
 
     /** NWS icon URL (".../icons/land/day/rain,80/tsra,60?size=small") to the WMO code of its worst sky. */
@@ -151,7 +168,8 @@ object Nws {
         return if (s.contains("km/h")) v else v * 1.609344
     }
 
-    private fun compass(s: String): Int {
+    /** "NW" to degrees. */
+    private fun degrees(s: String): Int {
         val i = listOf("N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW").indexOf(s)
         return if (i < 0) 0 else (i * 22.5).roundToInt()
     }

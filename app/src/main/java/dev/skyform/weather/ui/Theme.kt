@@ -32,6 +32,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
@@ -50,6 +51,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import dev.skyform.weather.Sky
 import kotlin.math.sin
@@ -99,8 +101,9 @@ fun CardTitle(text: String, modifier: Modifier = Modifier) =
     Text(text.uppercase(), modifier, color = Dim, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 1.2.sp)
 
 @Composable
-fun IconBtn(icon: Int, label: String, size: Dp = 44.dp, onClick: () -> Unit) {
-    Box(Modifier.size(size).tap(CircleShape, label = label, onClick = onClick), contentAlignment = Alignment.Center) {
+fun IconBtn(icon: Int, label: String, size: Dp = 44.dp, enabled: Boolean = true, onClick: () -> Unit) {
+    Box(Modifier.size(size).alpha(if (enabled) 1f else 0.3f).tap(CircleShape, enabled = enabled, label = label, onClick = onClick),
+        contentAlignment = Alignment.Center) {
         Icon(painterResource(icon), label, Modifier.size(size * 0.5f), tint = Color.White)
     }
 }
@@ -123,6 +126,21 @@ fun Pill(text: String, modifier: Modifier = Modifier, primary: Boolean = false, 
 
 // --- the sky ---------------------------------------------------------------------------------------------------------
 
+/**
+ * When the sky may move: only while [enabled] (the setting, and not in battery saver) and for 30 seconds after the
+ * last touch, scroll or return to the app. Asleep, it asks for no frames at all, so a page left open costs nothing.
+ */
+class Motion {
+    @Volatile private var last = System.nanoTime()
+    private val wake = Channel<Unit>(Channel.CONFLATED)
+    @Volatile var enabled = true
+        set(value) { field = value; wake.trySend(Unit) }
+
+    fun poke() { last = System.nanoTime(); wake.trySend(Unit) }
+    fun awake() = enabled && System.nanoTime() - last < 30_000_000_000L
+    suspend fun awaitAwake() { while (!awake()) wake.receive() }
+}
+
 private fun sky(sky: Sky, day: Boolean): Pair<Color, Color> = when (sky) {
     Sky.CLEAR -> if (day) Color(0xFF2A74E0) to Color(0xFF5AA9F0) else Color(0xFF060A1D) to Color(0xFF223068)
     Sky.PARTLY -> if (day) Color(0xFF3577CC) to Color(0xFF7DAFDD) else Color(0xFF0A1130) to Color(0xFF2C3961)
@@ -141,11 +159,11 @@ private fun sky(sky: Sky, day: Boolean): Pair<Color, Color> = when (sky) {
  * two finished pictures blended, not a sky redrawn in changing colors every frame.
  */
 @Composable
-fun SkyBackground(sky: Sky, day: Boolean, modifier: Modifier = Modifier, still: () -> Boolean = { false }) =
-    Crossfade(sky to day, modifier, tween(900), label = "sky") { (s, d) -> SkyLayer(s, d, still) }
+fun SkyBackground(sky: Sky, day: Boolean, motion: Motion, modifier: Modifier = Modifier, still: () -> Boolean = { false }) =
+    Crossfade(sky to day, modifier, tween(900), label = "sky") { (s, d) -> SkyLayer(s, d, motion, still) }
 
 @Composable
-private fun SkyLayer(sky: Sky, day: Boolean, still: () -> Boolean) {
+private fun SkyLayer(sky: Sky, day: Boolean, motion: Motion, still: () -> Boolean) {
     val (t0, t1) = sky(sky, day)
     // The sky's clock: 30 frames a second, and it stops while [still] (a swipe or a scroll), so the layer below keeps
     // its last picture and the GPU only moves the cards. It sleeps between its frames: asking for every display frame
@@ -155,6 +173,7 @@ private fun SkyLayer(sky: Sky, day: Boolean, still: () -> Boolean) {
     LaunchedEffect(Unit) {
         var last = 0L
         while (true) {
+            if (!motion.awake()) { last = 0L; motion.awaitAwake() }
             delay(28)
             withFrameNanos { now ->
                 if (last != 0L && !isStill()) seconds += ((now - last) / 1e9f).coerceAtMost(0.1f)

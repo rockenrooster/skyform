@@ -1,13 +1,19 @@
 package dev.skyform.weather.ui
 
+import android.Manifest
 import android.appwidget.AppWidgetManager
 import android.content.ComponentName
+import android.os.Build
 import android.text.format.DateFormat
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -47,11 +53,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.skyform.weather.BuildConfig
 import dev.skyform.weather.Locator
+import dev.skyform.weather.Notify
+import dev.skyform.weather.OpenMeteo
 import dev.skyform.weather.Place
 import dev.skyform.weather.R
 import dev.skyform.weather.Wmo
 import dev.skyform.weather.app
+import dev.skyform.weather.widget.NowWidget
 import dev.skyform.weather.widget.WeatherWidget
+import dev.skyform.weather.widget.WeekWidget
 import dev.skyform.weather.widget.WidgetArt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -167,13 +177,27 @@ private fun Choice(label: String, options: List<String>, selected: Int, onPick: 
                 val on = i == selected
                 Text(o, Modifier.background(if (on) Color.White else Color.Transparent, RoundedCornerShape(50))
                     .tap(RoundedCornerShape(50), light = on, label = "$label: $o") { onPick(i) }
-                    .padding(horizontal = 12.dp, vertical = 7.dp),
+                    .padding(horizontal = if (options.size > 3) 9.dp else 12.dp, vertical = 7.dp),
                     fontSize = 14.sp, color = if (on) Color(0xFF10233F) else Color.White, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal)
             }
         }
     }
 }
 
+@Composable
+private fun SwitchRow(title: String, sub: String?, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().tap(label = title) { onChange(!checked) }.padding(vertical = 6.dp, horizontal = 2.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(title, fontSize = 16.sp, color = Color.White)
+            if (sub != null) Text(sub, fontSize = 12.sp, color = Dim, lineHeight = 16.sp)
+        }
+        Spacer(Modifier.width(8.dp))
+        Switch(checked, onChange)
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SettingsSheet(onUpdate: () -> Unit) {
     val ctx = LocalContext.current
@@ -184,9 +208,29 @@ fun SettingsSheet(onUpdate: () -> Unit) {
     val checks by repo.checkUpdates.collectAsState()
     val places by repo.places.collectAsState()
     val forecasts by repo.forecasts.collectAsState()
+    val source by repo.source.collectAsState()
+    val model by repo.model.collectAsState()
+    val cards by repo.cards.collectAsState()
+    val skyMotion by repo.skyMotion.collectAsState()
+    val nNow by repo.notifyNow.collectAsState()
+    val nAlerts by repo.notifyAlerts.collectAsState()
+    val nRain by repo.notifyRain.collectAsState()
+    val nDaily by repo.notifyDaily.collectAsState()
+    val dailyAt by repo.dailyAt.collectAsState()
     val scope = rememberCoroutineScope()
     var updateMsg by remember { mutableStateOf<String?>(null) }
-    val source by repo.source.collectAsState()
+    fun refreshAll() = app.scope.launch { repo.places.value.forEach { repo.refresh(it, 0) } }
+
+    // A notification setting turns on only once Android allows notifications (asked the first time, Android 13+)
+    var pendingKey by remember { mutableStateOf<String?>(null) }
+    val askNotify = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        pendingKey?.let { if (granted) repo.setNotify(it, true) }
+        pendingKey = null
+    }
+    fun setNotify(key: String, on: Boolean) {
+        if (on && Build.VERSION.SDK_INT >= 33 && !Notify.allowed(ctx)) { pendingKey = key; askNotify.launch(Manifest.permission.POST_NOTIFICATIONS) }
+        else repo.setNotify(key, on)
+    }
 
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)
         .navigationBarsPadding().padding(bottom = 16.dp)) {
@@ -194,34 +238,84 @@ fun SettingsSheet(onUpdate: () -> Unit) {
         Section("Forecast")
         Choice("Source", listOf("NWS", "Open-Meteo"), if (source == "nws") 0 else 1) { i ->
             repo.setSource(if (i == 0) "nws" else "om")
-            app.scope.launch { repo.places.value.forEach { repo.refresh(it, 0) } }
+            refreshAll()
         }
-        Text(if (source == "nws") "National Weather Service for US places, with its alerts; Open-Meteo adds UV, sun times and days 8–14, and covers places outside the US."
+        Text(if (source == "nws") "National Weather Service for US places, with its alerts; Open-Meteo adds UV, sun times, air quality and days 8–14, and covers places outside the US."
             else "Open-Meteo's models everywhere; no alerts.", fontSize = 12.sp, color = Dim, lineHeight = 16.sp)
+        Text("Open-Meteo model", Modifier.padding(top = 12.dp, bottom = 6.dp), fontSize = 16.sp, color = Color.White)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            OpenMeteo.models.forEach { (id, name) ->
+                val on = id == model
+                Text(name, Modifier.background(if (on) Color.White else Color.White.copy(alpha = 0.08f), RoundedCornerShape(50))
+                    .tap(RoundedCornerShape(50), light = on, label = "Model: $name") { if (!on) { repo.setModel(id); refreshAll() } }
+                    .padding(horizontal = 12.dp, vertical = 7.dp),
+                    fontSize = 14.sp, color = if (on) Color(0xFF10233F) else Color.White, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal)
+            }
+        }
+        Text("Best match picks the best model for each place. Some models forecast fewer days or give no chance of rain.",
+            Modifier.padding(top = 6.dp), fontSize = 12.sp, color = Dim, lineHeight = 16.sp)
+
         Section("Units")
         Choice("Temperature", listOf("°F", "°C"), if (u.fahrenheit) 0 else 1) { repo.setUnits(u.copy(fahrenheit = it == 0)) }
-        Choice("Wind", listOf("mph", "km/h", "m/s"), listOf("mph", "kmh", "ms").indexOf(u.wind).coerceAtLeast(0)) {
-            repo.setUnits(u.copy(wind = listOf("mph", "kmh", "ms")[it]))
+        val winds = listOf("mph", "kmh", "ms", "kn", "bft")
+        Choice("Wind", listOf("mph", "km/h", "m/s", "kn", "Bft"), winds.indexOf(u.wind).coerceAtLeast(0)) { repo.setUnits(u.copy(wind = winds[it])) }
+        Choice("Rain and snow", listOf("in", "mm"), if (u.inches) 0 else 1) { repo.setUnits(u.copy(inches = it == 0)) }
+        val pressures = listOf("inhg", "hpa", "mmhg")
+        Choice("Pressure", listOf("inHg", "hPa", "mmHg"), pressures.indexOf(u.pressureUnit).coerceAtLeast(0)) {
+            repo.setUnits(u.copy(pressureUnit = pressures[it]))
         }
-        Choice("Rain and pressure", listOf("in", "mm"), if (u.inches) 0 else 1) { repo.setUnits(u.copy(inches = it == 0)) }
         Choice("Clock", listOf("12 h", "24 h"), if (u.clock24) 1 else 0) { repo.setUnits(u.copy(clock24 = it == 1)) }
 
-        Section("Home-screen widget")
+        Section("Cards")
+        cards.forEachIndexed { i, (card, on) ->
+            Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(card.title, Modifier.weight(1f), fontSize = 16.sp, color = if (on) Color.White else Dim)
+                IconBtn(R.drawable.ic_up, "Move ${card.title} up", 40.dp, enabled = i > 0) {
+                    repo.setCards(cards.toMutableList().apply { add(i - 1, removeAt(i)) })
+                }
+                Spacer(Modifier.width(6.dp))
+                Switch(on, { v -> repo.setCards(cards.mapIndexed { j, c -> if (j == i) c.first to v else c }) })
+            }
+        }
+        Text("The current weather and alerts stay on top. Rain soon shows only when rain or snow is near.",
+            Modifier.padding(top = 4.dp), fontSize = 12.sp, color = Dim, lineHeight = 16.sp)
+
+        Section("Notifications")
+        val first = places.firstOrNull()?.name ?: "the first place"
+        SwitchRow("Temperature in the status bar", "For $first, kept up to date", nNow) { setNotify("notify_now", it) }
+        SwitchRow("Weather alerts", "Watches and warnings from the National Weather Service (US)", nAlerts) { setNotify("notify_alerts", it) }
+        SwitchRow("Rain or snow starting soon", "Up to 45 minutes ahead, at most every 3 hours", nRain) { setNotify("notify_rain", it) }
+        SwitchRow("Today's forecast", "Each morning after the time below", nDaily) { setNotify("notify_daily", it) }
+        if (nDaily) {
+            val times = listOf(6, 7, 8, 9)
+            Choice("Time", times.map { if (u.clock24) "%02d:00".format(it) else "$it AM" }, times.indexOf(dailyAt / 60).coerceAtLeast(0)) {
+                repo.setDailyAt(times[it] * 60)
+            }
+        }
+        Text("Notifications follow the first place and are checked about every 30 minutes, as Android allows, to save battery.",
+            Modifier.padding(top = 4.dp), fontSize = 12.sp, color = Dim, lineHeight = 16.sp)
+
+        Section("Appearance")
+        SwitchRow("Moving sky", "Rain, snow, stars and clouds drift for 30 seconds after a touch; always still in battery saver",
+            skyMotion) { repo.setSkyMotion(it) }
+
+        Section("Home-screen widgets")
         val place = places.firstOrNull()
         val fc = place?.let { forecasts[it.id] }
         // The widget's look, drawn by the same code as the widget
-        Column(Modifier.fillMaxWidth().background(Color(0xFF12171F).copy(alpha = 0.35f + alpha * 0.65f), RoundedCornerShape(20.dp)).padding(12.dp)) {
+        Column(Modifier.fillMaxWidth().background(Color(0xFF12171F).copy(alpha = 0.35f + alpha * 0.65f), RoundedCornerShape(20.dp)).padding(vertical = 12.dp)) {
             val now = LocalDateTime.now()
             val is24 = DateFormat.is24HourFormat(ctx)
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(now.format(DateTimeFormatter.ofPattern(if (is24) "H:mm" else "h:mm")), fontSize = 44.sp, fontWeight = FontWeight.Light, color = Color.White)
                 Column(Modifier.padding(start = 8.dp)) {
                     if (!is24) Text(now.format(DateTimeFormatter.ofPattern("a")), fontSize = 12.sp, color = Color.White)
                     Text(now.format(DateTimeFormatter.ofPattern("EEE, MMM d")), fontSize = 16.sp, color = Color.White)
                 }
             }
-            Text(place?.let { if (it.gps && it.detail.isNotBlank()) it.detail else it.name } ?: "No place yet", fontSize = 14.sp, color = Color.White)
-            Text("Temperature ${u.tName}, Humidity %", fontSize = 11.sp, color = Dim)
+            Text(place?.let { if (it.gps && it.detail.isNotBlank()) it.detail else it.name } ?: "No place yet", Modifier.padding(horizontal = 12.dp),
+                fontSize = 14.sp, color = Color.White)
+            Text("Temperature ${u.tName}, Humidity %", Modifier.padding(horizontal = 12.dp), fontSize = 11.sp, color = Dim)
             if (fc != null) BoxWithConstraints(Modifier.fillMaxWidth()) {
                 val d = LocalDensity.current
                 val wPx = with(d) { maxWidth.roundToPx() }
@@ -238,20 +332,16 @@ fun SettingsSheet(onUpdate: () -> Unit) {
         }
         val mgr = AppWidgetManager.getInstance(ctx)
         if (mgr.isRequestPinAppWidgetSupported) {
-            Pill("Add the widget to the home screen", Modifier.fillMaxWidth().padding(top = 6.dp)) {
-                mgr.requestPinAppWidget(ComponentName(ctx, WeatherWidget::class.java), null, null)
+            listOf("Add the clock and forecast" to WeatherWidget::class.java, "Add the weather now (small)" to NowWidget::class.java,
+                "Add the week" to WeekWidget::class.java).forEach { (label, cls) ->
+                Pill(label, Modifier.fillMaxWidth().padding(top = 6.dp)) { mgr.requestPinAppWidget(ComponentName(ctx, cls), null, null) }
             }
         }
+        Text("Widgets show the first place and refresh about every 30 minutes; the button on a widget refreshes it at once.",
+            Modifier.padding(top = 6.dp), fontSize = 12.sp, color = Dim, lineHeight = 16.sp)
 
         Section("Updates")
-        Row(Modifier.fillMaxWidth().tap(label = "Check for updates automatically") { repo.setCheckUpdates(!checks) }.padding(vertical = 6.dp, horizontal = 2.dp),
-            verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("Check for updates", fontSize = 16.sp, color = Color.White)
-                Text("Asks GitHub for a newer build when the app opens", fontSize = 12.sp, color = Dim)
-            }
-            Switch(checks, { repo.setCheckUpdates(it) })
-        }
+        SwitchRow("Check for updates", "Asks GitHub for a newer build when the app opens", checks) { repo.setCheckUpdates(it) }
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Version ${BuildConfig.VERSION_NAME}" + if (BuildConfig.BUILD_NUMBER > 0) " · build ${BuildConfig.BUILD_NUMBER}" else " · local build",
                 Modifier.weight(1f), fontSize = 14.sp, color = Dim)
@@ -268,8 +358,9 @@ fun SettingsSheet(onUpdate: () -> Unit) {
         updateMsg?.let { Text(it, Modifier.padding(top = 6.dp), fontSize = 13.sp, color = Color.White) }
 
         Section("About")
-        Text("Forecasts and alerts by the National Weather Service (weather.gov); more forecasts and place search by " +
-            "Open-Meteo.com (CC BY 4.0). Street names come from your phone's geocoder. A place's coordinates are only sent " +
-            "to these two services, to get its forecast.", fontSize = 13.sp, color = Dim, lineHeight = 18.sp)
+        Text("Forecasts and alerts by the National Weather Service (weather.gov); more forecasts, air quality and place search by " +
+            "Open-Meteo.com (CC BY 4.0); radar by RainViewer; map © OpenStreetMap contributors. Moon and twilight times are " +
+            "computed on the phone. Street names come from your phone's geocoder. A place's coordinates are sent only to these " +
+            "services, to get its weather, and the radar map asks for the area around it.", fontSize = 13.sp, color = Dim, lineHeight = 18.sp)
     }
 }

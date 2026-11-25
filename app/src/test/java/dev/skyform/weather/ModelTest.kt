@@ -118,6 +118,34 @@ class ModelTest {
     }
 
     @Test
+    fun extras() {
+        // 15-minute precipitation; fields the document leaves out are unknown, not zero
+        val f = OpenMeteo.parse(json.replace("\"daily\":", "\"minutely_15\":{\"time\":[1795620600,1795621500],\"precipitation\":[0.0,0.4]},\"daily\":"), 0)
+        assertEquals(2, f.quarters.size)
+        assertEquals(0.4, f.quarters[1].precip, 1e-9)
+        assertEquals(-1, f.hours[0].cloud)
+        assertTrue(f.hours[0].feels.isNaN())
+        // air quality: nulls are skipped, pollen only where forecast
+        val air = OpenMeteo.parseAir("""{"current":{"us_aqi":57.4,"pm2_5":12.1,"pm10":20.0,"ozone":61.0,"nitrogen_dioxide":9.5,
+            "sulphur_dioxide":1.0,"carbon_monoxide":180.0,"grass_pollen":35.2,"birch_pollen":null},
+            "hourly":{"time":[1795618800,1795622400],"us_aqi":[55,null]}}""")!!
+        assertEquals(57, air.aqi)
+        assertEquals(1, Aqi.level(air.aqi))
+        assertEquals(listOf("Grass" to 35.2), air.pollen)
+        assertEquals(listOf(1795618800L to 55), air.hours)
+        assertEquals(null, OpenMeteo.parseAir("""{"current":{"us_aqi":null}}"""))
+        // wind in Beaufort, pressure units
+        val u = Units(fahrenheit = true, wind = "bft", clock24 = false, inches = true)
+        assertEquals("inhg", u.pressureUnit)
+        assertEquals("3 Bft", u.w(15.0))
+        assertEquals(0, Units.beaufort(0.5))
+        assertEquals(12, Units.beaufort(130.0))
+        assertEquals("762 mmHg", u.copy(pressureUnit = "mmhg").pressure(1016.2))
+        // the NWS's wind direction ("SE") in degrees
+        assertEquals(135, Nws.parse(nwsDocs(), 1795620600_000L)!!.hours[0].windDir)
+    }
+
+    @Test
     fun search() {
         val r = OpenMeteo.parseSearch("""{"results":[{"name":"Chicago","latitude":41.85003,"longitude":-87.65005,"admin1":"Illinois","country":"United States"}]}""")
         assertEquals("Chicago", r[0].name)
