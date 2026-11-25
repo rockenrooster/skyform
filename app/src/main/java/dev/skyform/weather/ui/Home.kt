@@ -1,0 +1,303 @@
+package dev.skyform.weather.ui
+
+import android.Manifest
+import android.content.Intent
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Text
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
+import dev.skyform.weather.Forecast
+import dev.skyform.weather.Locator
+import dev.skyform.weather.Place
+import dev.skyform.weather.R
+import dev.skyform.weather.Sky
+import dev.skyform.weather.Units
+import dev.skyform.weather.Wmo
+import dev.skyform.weather.app
+import dev.skyform.weather.update.UpdateUi
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+
+enum class SheetKind { Places, Settings, Update }
+
+/** A named section in system traces (scripts\trace-top.py); costs nothing while nobody traces. */
+inline fun <T> traced(name: String, block: () -> T): T {
+    android.os.Trace.beginSection(name)
+    try { return block() } finally { android.os.Trace.endSection() }
+}
+
+/** Its own recomposition scope: state read in [content] recomposes only it (a plain inline block would recompose its caller). */
+@Composable
+private fun Scoped(content: @Composable () -> Unit) = content()
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SkyformApp() {
+    val ctx = LocalContext.current
+    val app = ctx.app
+    val repo = app.repo
+    val places by repo.places.collectAsState()
+    val units by repo.units.collectAsState()
+    val forecasts by repo.forecasts.collectAsState()
+    val busy by repo.busy.collectAsState()
+    val errors by repo.errors.collectAsState()
+    val scope = rememberCoroutineScope()
+    var sheet by remember { mutableStateOf<SheetKind?>(null) }
+    var locating by remember { mutableStateOf(false) }
+    val pager = rememberPagerState { places.size }
+    // When anything last scrolled (no state: the sky reads it each frame); the sky holds still meanwhile
+    val lastScroll = remember { longArrayOf(0L) }
+    val scrollWatch = remember {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                lastScroll[0] = System.nanoTime()
+                return Offset.Zero
+            }
+        }
+    }
+
+    fun locate() = scope.launch {
+        locating = true
+        try { repo.locate() } finally { locating = false }
+        pager.scrollToPage(0)
+    }
+    val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
+        if (res.values.any { it }) locate()
+    }
+    fun askLocation() {
+        if (Locator.allowed(ctx)) locate()
+        else permission.launch(arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION))
+    }
+
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        scope.launch {
+            val list = repo.places.value
+            if (list.any { it.gps } && Locator.allowed(ctx)) repo.locate()
+            list.getOrNull(pager.currentPage)?.takeIf { !it.gps }?.let { repo.refresh(it) }
+        }
+        if (repo.checkUpdates.value) app.updater.check()
+    }
+
+    // Read inside the small composables below, not here: a swipe that changes the page then recomposes only the sky
+    // and the top bar, never the pages.
+    val forecastOf: (String) -> Forecast? = { id -> forecasts[id] ?: repo.forecast(id) }
+    val placeInView = { places.getOrNull(pager.currentPage) }
+
+    MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFF9CCBFF), surface = SheetBg, background = SheetBg)) {
+        // Refresh the place in view once a swipe has settled (nothing extra runs while the pages move); scoped so the
+        // settled page is not read by this whole screen
+        Scoped {
+            LaunchedEffect(pager.settledPage, places.size) {
+                places.getOrNull(pager.settledPage)?.let { repo.refresh(it) }
+            }
+        }
+        Box(Modifier.fillMaxSize().background(Color(0xFF0E1A2E))) {
+            Scoped {
+                val fc = placeInView()?.let { forecastOf(it.id) }
+                SkyBackground(fc?.let { Wmo.sky(it.current.code) } ?: Sky.CLEAR, fc?.current?.isDay ?: true,
+                    still = { pager.isScrollInProgress || System.nanoTime() - lastScroll[0] < 300_000_000L })
+            }
+            if (places.isEmpty()) {
+                Welcome(locating, ::askLocation) { sheet = SheetKind.Places }
+            } else {
+                Column(Modifier.fillMaxSize().nestedScroll(scrollWatch)) {
+                    Scoped {
+                        val place = placeInView()
+                        TopBar(place, place?.let { forecastOf(it.id) }, pager.currentPage, places.size,
+                            place != null && (place.id in busy || (place.gps && locating)),
+                            onPlaces = { sheet = SheetKind.Places }, onSettings = { sheet = SheetKind.Settings })
+                    }
+                    UpdateUi.Banner { sheet = SheetKind.Update }
+                    // Every place's page stays built (a page built mid-swipe costs several frames)
+                    HorizontalPager(pager, Modifier.weight(1f), beyondViewportPageCount = (places.size - 1).coerceIn(1, 9),
+                        key = { places[it].id }) { page ->
+                        traced("SF page $page") {
+                            val p = places[page]
+                            Page(forecastOf(p.id), units, errors[p.id]) { if (p.gps) repo.locate() else repo.refresh(p, 0) }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (sheet != null) {
+            val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+            ModalBottomSheet({ sheet = null }, sheetState = state, containerColor = SheetBg, contentColor = Color.White) {
+                when (sheet) {
+                    SheetKind.Places -> PlacesSheet(
+                        onPick = { i -> scope.launch { snapshotFlow { pager.pageCount }.first { it > i }; pager.scrollToPage(i) }; sheet = null },
+                        onLocate = { askLocation(); sheet = null })
+                    SheetKind.Settings -> SettingsSheet { sheet = SheetKind.Update }
+                    SheetKind.Update -> UpdateUi.Sheet()
+                    null -> Unit
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TopBar(place: Place?, fc: Forecast?, page: Int, count: Int, updating: Boolean, onPlaces: () -> Unit, onSettings: () -> Unit) {
+    Row(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 6.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        IconBtn(R.drawable.ic_list, "Places", onClick = onPlaces)
+        Column(Modifier.weight(1f).tap(RoundedCornerShape(14.dp), label = "Places", onClick = onPlaces).padding(vertical = 4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (place?.gps == true) Icon(painterResource(R.drawable.ic_place), null, Modifier.size(16.dp), tint = Color.White)
+                Text(place?.name ?: "", fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Color.White, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis)
+            }
+            val sub = listOfNotNull(place?.detail?.takeIf { it.isNotBlank() && !place.gps }, if (updating) "Updating…" else fc?.let { updated(it) }).joinToString(" · ")
+            if (sub.isNotEmpty()) Text(sub, fontSize = 12.sp, color = Dim, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (count > 1) Row(Modifier.padding(top = 5.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                repeat(count) { i ->
+                    Box(Modifier.size(if (i == page) 7.dp else 5.dp).background(Color.White.copy(alpha = if (i == page) 1f else 0.4f), CircleShape))
+                }
+            }
+        }
+        IconBtn(R.drawable.ic_settings, "Settings", onClick = onSettings)
+    }
+}
+
+private fun updated(fc: Forecast): String {
+    val min = ((System.currentTimeMillis() - fc.fetchedAt) / 60_000).toInt()
+    return when {
+        min < 1 -> "Updated just now"
+        min < 60 -> "Updated $min min ago"
+        min < 60 * 24 -> "Updated ${min / 60} h ago"
+        else -> "Updated ${min / 1440} d ago"
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun Page(fc: Forecast?, u: Units, error: String?, onRefresh: suspend () -> Unit) {
+    val ctx = LocalContext.current
+    // The spinner is for a pull only; refreshes the app starts itself show "Updating…" in the top bar (a spinner on
+    // every swipe would also redraw the page each frame)
+    val scope = rememberCoroutineScope()
+    var pulled by remember { mutableStateOf(false) }
+    val pull: () -> Unit = { if (!pulled) scope.launch { pulled = true; try { onRefresh() } finally { pulled = false } } }
+    // its own render node: sliding the page moves the node instead of re-recording everything on it each frame
+    PullToRefreshBox(pulled, pull, Modifier.fillMaxSize().graphicsLayer()) {
+        val bottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+        // A plain scrolling column, not a lazy list: eight cards built once (a lazy list rebuilt them each time a page
+        // slid back into view: about 11 ms in one frame)
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+            .padding(start = 16.dp, top = 4.dp, end = 16.dp, bottom = bottom + 24.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            if (fc == null) {
+                Column(Modifier.fillMaxWidth().padding(top = 120.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    if (error == null) {
+                        CircularProgressIndicator(color = Color.White)
+                        Spacer(Modifier.height(16.dp))
+                        Text("Fetching the forecast…", color = Dim)
+                    } else {
+                        Text(error, color = Color.White, fontSize = 17.sp)
+                        Spacer(Modifier.height(16.dp))
+                        Pill("Try again", primary = true, onClick = pull)
+                    }
+                }
+                return@Column
+            }
+            if (error != null) {
+                Text("$error · showing the last forecast", Modifier.fillMaxWidth().background(Color(0x55B3261E), RoundedCornerShape(12.dp))
+                    .padding(10.dp), color = Color.White, fontSize = 13.sp)
+            }
+            if (fc.alerts.isNotEmpty()) Alerts(fc, u)
+            traced("SF hero") { Hero(fc, u) }
+            traced("SF hourly") { HourlyCard(fc, u) }
+            traced("SF daily") { DailyCard(fc, u) }
+            traced("SF details") { Details(fc, u) }
+            run {
+                val nws = fc.source == "nws"
+                Text(if (nws) "Forecast by the National Weather Service (weather.gov)\nUV, sun times and days 8–14 by Open-Meteo.com"
+                    else "Weather data by Open-Meteo.com", Modifier.fillMaxWidth()
+                    .tap(RoundedCornerShape(10.dp), label = "Open the weather service's site") {
+                        val url = if (nws) "https://www.weather.gov/" else "https://open-meteo.com/"
+                        runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+                    }.padding(10.dp), color = Faint, fontSize = 12.sp, textAlign = TextAlign.Center, lineHeight = 17.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun Welcome(locating: Boolean, onLocate: () -> Unit, onSearch: () -> Unit) {
+    Column(Modifier.fillMaxSize().statusBarsPadding().padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center) {
+        Image(painterResource(R.drawable.wx_partly_day), null, Modifier.size(150.dp))
+        Spacer(Modifier.height(12.dp))
+        Text("Skyform", fontSize = 44.sp, fontWeight = FontWeight.Light, color = Color.White)
+        Spacer(Modifier.height(8.dp))
+        Text("Hour-by-hour charts, two weeks ahead, and a home-screen clock with the forecast.", fontSize = 16.sp,
+            color = Dim, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(36.dp))
+        if (locating) {
+            CircularProgressIndicator(color = Color.White)
+            Spacer(Modifier.height(12.dp))
+            Text("Finding you…", color = Dim)
+        } else {
+            Pill("Use my location", Modifier.width(260.dp), primary = true, onClick = onLocate)
+            Spacer(Modifier.height(12.dp))
+            Pill("Search for a city", Modifier.width(260.dp), onClick = onSearch)
+        }
+    }
+}

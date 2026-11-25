@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#2F6FD0</color>
+    <!-- Everything is drawn by Compose; the window shows this until the first frame. -->
+    <style name="Theme.Skyform" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF0E1A2E</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Skyform</string>
+    <string name="widget_name">Skyform clock and forecast</string>
+    <string name="widget_description">Clock, 24-hour temperature and humidity chart, and the week ahead</string>
+    <string name="refresh">Refresh weather</string>
+</resources>
