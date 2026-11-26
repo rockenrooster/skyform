@@ -4,10 +4,13 @@ import dev.skyform.weather.update.UrlHttp
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
 import java.time.LocalDate
 import java.time.OffsetDateTime
 import java.util.Locale
+import kotlin.math.cos
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /**
@@ -19,19 +22,16 @@ object Nws {
     private const val API = "https://api.weather.gov"
     private const val ACCEPT = "application/geo+json"
 
-    /** The raw documents for a place ("hourly", "daily", and when they come, "obs", "alerts"); throws outside the US. */
-    suspend fun fetch(lat: Double, lon: Double): Map<String, String> = coroutineScope {
+    /**
+     * The raw documents for a place ("hourly", "daily", and when they come, "obs", "alerts"); throws outside the US.
+     * [dir] keeps the state's station list.
+     */
+    suspend fun fetch(lat: Double, lon: Double, dir: File): Map<String, String> = coroutineScope {
         val ll = "%.4f,%.4f".format(Locale.US, lat, lon)
         val pt = JSONObject(get("$API/points/$ll")).getJSONObject("properties")
         val hourly = async { get(pt.getString("forecastHourly")) }
         val daily = async { get(pt.getString("forecast")) }
-        val obs = async {
-            runCatching {
-                val st = JSONObject(get(pt.getString("observationStations") + "?limit=1")).getJSONArray("features")
-                    .getJSONObject(0).getJSONObject("properties").getString("stationIdentifier")
-                get("$API/stations/$st/observations/latest")
-            }.getOrNull()
-        }
+        val obs = async { runCatching { nearestObs(lat, lon, pt, dir) }.getOrNull() }
         val alerts = async { runCatching { get("$API/alerts/active?point=$ll") }.getOrNull() }
         buildMap {
             put("hourly", hourly.await())
@@ -40,6 +40,62 @@ object Nws {
             alerts.await()?.let { put("alerts", it) }
         }
     }
+
+    /**
+     * The latest quality-checked observation from the nearest station that has a fresh one. The forecast point's own
+     * list holds only the official (airport) stations, often 20+ km away; the state's list adds the citizen (CWOP)
+     * ones, often one in town. The point's list stays in for places near a state line, and in case the state's fails.
+     */
+    private fun nearestObs(lat: Double, lon: Double, pt: JSONObject, dir: File): String? {
+        val state = pt.optJSONObject("relativeLocation")?.optJSONObject("properties")?.str("state").orEmpty()
+        val all = runCatching { stateStations(state, dir) }.getOrDefault(emptyList()) +
+            runCatching { stations(JSONObject(get(pt.getString("observationStations") + "?limit=3"))) }.getOrDefault(emptyList())
+        return nearest(all, lat, lon).take(5).firstNotNullOfOrNull { id ->
+            runCatching { get("$API/stations/$id/observations/latest?require_qc=true") }.getOrNull()
+                ?.takeIf { fresh(JSONObject(it).getJSONObject("properties"), System.currentTimeMillis() / 1000) }
+        }
+    }
+
+    /** Every station in [state] (one request per 500; a state has hundreds), kept in [dir] for 30 days. */
+    private fun stateStations(state: String, dir: File): List<Triple<String, Double, Double>> {
+        if (state.isEmpty()) return emptyList()
+        val f = File(dir, "stations-$state.tsv")
+        if (System.currentTimeMillis() - f.lastModified() > 30 * 86400_000L) {
+            val all = mutableListOf<Triple<String, Double, Double>>()
+            var url: String? = "$API/stations?state=$state&limit=500"
+            for (i in 0 until 40) {
+                val d = JSONObject(get(url ?: break))
+                val page = stations(d)
+                if (page.isEmpty()) break
+                all += page
+                url = d.optJSONObject("pagination")?.str("next")?.ifEmpty { null }
+            }
+            if (all.isEmpty()) return emptyList()
+            // whole or not at all: another place's refresh may be reading it
+            val tmp = File.createTempFile("stations", null, dir)
+            tmp.writeText(all.joinToString("\n") { (id, la, lo) -> "$id\t$la\t$lo" })
+            if (!tmp.renameTo(f)) tmp.delete()
+        }
+        return f.readLines().map { it.split('\t').let { (id, la, lo) -> Triple(id, la.toDouble(), lo.toDouble()) } }
+    }
+
+    /** A station list's (GeoJSON, longitude first) stations as (id, lat, lon). */
+    internal fun stations(d: JSONObject): List<Triple<String, Double, Double>> = d.optJSONArray("features")?.let { a ->
+        (0 until a.length()).mapNotNull { i ->
+            val s = a.getJSONObject(i)
+            val c = s.optJSONObject("geometry")?.optJSONArray("coordinates") ?: return@mapNotNull null
+            Triple(s.getJSONObject("properties").getString("stationIdentifier"), c.getDouble(1), c.getDouble(0))
+        }
+    }.orEmpty()
+
+    /** The stations' ids, nearest the place first, each once. */
+    internal fun nearest(all: List<Triple<String, Double, Double>>, lat: Double, lon: Double): List<String> {
+        val k = cos(Math.toRadians(lat))
+        return all.sortedBy { (_, la, lo) -> (la - lat).pow(2) + ((lo - lon) * k).pow(2) }.map { it.first }.distinct()
+    }
+
+    /** An observation with a temperature, taken under 90 minutes before [now] (seconds). */
+    private fun fresh(o: JSONObject, now: Long) = !o.v("temperature").isNaN() && now - epoch(o.getString("timestamp")) < 90 * 60
 
     /** One retry on a server error: the NWS API has brief 5xx hiccups. */
     private fun get(url: String): String = try {
@@ -56,8 +112,15 @@ object Nws {
             .let { a -> (0 until a.length()).map { a.getJSONObject(it) } }
         if (periods.isEmpty()) return null
         val offset = OffsetDateTime.parse(periods[0].getString("startTime")).offset
-        val hours = periods.map { p ->
-            Hour(epoch(p.getString("startTime")), temp(p), p.v("relativeHumidity").r(), p.v("probabilityOfPrecipitation").r(),
+        // now: the nearest station's observation when it is recent and has a temperature, else the first forecast hour
+        val obs = docs.str("obs").takeIf { it.isNotEmpty() }?.let { JSONObject(it).getJSONObject("properties") }
+            ?.takeIf { o -> fresh(o, fetchedAt / 1000) }
+        // A measured "now" is where the hours start, so the chart agrees with it: the forecast's miss fades out over
+        // 6 hours. ponytail: a fixed fade; a morning inversion's miss clears faster than a stuck cold wedge's.
+        val miss = obs?.let { it.v("temperature") - temp(periods[0]) } ?: 0.0
+        val hours = periods.mapIndexed { i, p ->
+            Hour(epoch(p.getString("startTime")), temp(p) + miss * (6 - i).coerceAtLeast(0) / 6,
+                p.v("relativeHumidity").r(), p.v("probabilityOfPrecipitation").r(),
                 code(p.str("icon")), p.optBoolean("isDaytime", true), Double.NaN, Double.NaN, p.v("dewpoint"),
                 wind(p.str("windSpeed")), 0.0, windDir = degrees(p.str("windDirection")))
         }
@@ -82,10 +145,7 @@ object Nws {
                     ps.joinToString("\n\n") { "${it.str("name")}: ${it.str("detailedForecast")}" })
             }
 
-        // now: the nearest station's observation when it is recent and has a temperature, else the first forecast hour
         val first = hours[0]
-        val obs = docs.str("obs").takeIf { it.isNotEmpty() }?.let { JSONObject(it).getJSONObject("properties") }
-            ?.takeIf { o -> !o.v("temperature").isNaN() && fetchedAt / 1000 - epoch(o.getString("timestamp")) < 2 * 3600 }
         val current = if (obs != null) {
             val t = obs.v("temperature")
             Current(epoch(obs.getString("timestamp")), t, obs.v("windChill").or(obs.v("heatIndex")).or(t),

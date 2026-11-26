@@ -76,11 +76,24 @@ class ModelTest {
     }
 
     @Test
+    fun nearestStation() {
+        // a station list as api.weather.gov sends it (GeoJSON: longitude first), around Denver's center
+        val list = Nws.stations(org.json.JSONObject("""{"features":[
+            {"geometry":{"coordinates":[-104.6562,39.8466]},"properties":{"stationIdentifier":"KDEN"}},
+            {"geometry":null,"properties":{"stationIdentifier":"NOGEO"}},
+            {"geometry":{"coordinates":[-105.1,39.7]},"properties":{"stationIdentifier":"D5678"}},
+            {"geometry":{"coordinates":[-104.98,39.74]},"properties":{"stationIdentifier":"C1234"}}]}"""))
+        assertEquals(listOf("C1234", "D5678", "KDEN"), Nws.nearest(list + list.take(1), 39.7392, -104.9903))
+    }
+
+    @Test
     fun nws() {
         val docs = nwsDocs()
         val n = Nws.parse(docs, 1795620600_000L)!!
         assertEquals(3, n.hours.size)
-        assertEquals((56 - 32) * 5 / 9.0, n.hours[0].temp, 1e-9)
+        // the station measured 14 °C against the forecast's 56 °F: the hours start there and fade back over 6 hours
+        assertEquals(14.0, n.hours[0].temp, 1e-9)
+        assertEquals((55 - 32) * 5 / 9.0 + (14 - (56 - 32) * 5 / 9.0) * 5 / 6, n.hours[1].temp, 1e-9)
         assertEquals("null chance is 0", 0, n.hours[2].pop)
         assertEquals("the higher wind of a range", 15 * 1.609344, n.hours[1].wind, 1e-9)
         assertEquals("the worst sky of a split icon", 95, n.hours[2].code)

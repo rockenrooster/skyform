@@ -205,7 +205,7 @@ class Repo(private val app: Context) {
         fun get(url: String) = String(UrlHttp.get(url, 4 shl 20, "application/json"), Charsets.UTF_8)
         val om = async { runCatching { get(OpenMeteo.url(p.lat, p.lon, model.value)) }.getOrNull() }
         val aq = async { runCatching { get(OpenMeteo.airUrl(p.lat, p.lon)) }.getOrNull() }
-        val nws = if (source.value == "nws") async { runCatching { Nws.fetch(p.lat, p.lon) }.getOrNull() } else null
+        val nws = if (source.value == "nws") async { runCatching { Nws.fetch(p.lat, p.lon, app.cacheDir) }.getOrNull() } else null
         JSONObject().apply {
             om.await()?.let { put("om", it) }
             aq.await()?.let { put("aq", it) }
