@@ -87,6 +87,31 @@ class ModelTest {
     }
 
     @Test
+    fun nwsGrid() {
+        // the forecast grid (degC, km/h; runs of hours) overrides the hourly forecast's numbers where it has them
+        val docs = nwsDocs().apply {
+            remove("obs")
+            put("grid", """{
+              "temperature":{"uom":"wmoUnit:degC","values":[{"validTime":"2026-11-25T15:00:00+00:00/PT2H","value":5.0},
+                                                          {"validTime":"2026-11-25T17:00:00+00:00/PT1H","value":null}]},
+              "relativeHumidity":{"uom":"wmoUnit:degF","values":[{"validTime":"2026-11-25T15:00:00+00:00/PT3H","value":1}]},
+              "windSpeed":{"uom":"wmoUnit:km_h-1","values":[{"validTime":"2026-11-25T15:00:00+00:00/PT1H","value":20.0}]},
+              "maxTemperature":{"uom":"wmoUnit:degC","values":[{"validTime":"2026-11-25T13:00:00+00:00/PT13H","value":15.0}]},
+              "minTemperature":{"uom":"wmoUnit:degC","values":[{"validTime":"2026-11-25T12:00:00+00:00/PT3H","value":9.0},
+                                                             {"validTime":"2026-11-26T01:00:00+00:00/PT14H","value":3.0}]}}""")
+        }
+        val n = Nws.parse(docs, 1795620600_000L)!!
+        assertEquals("a 2-hour run fills both hours", listOf(5.0, 5.0), n.hours.take(2).map { it.temp })
+        assertEquals("a null falls back to the hourly's", (54 - 32) * 5 / 9.0, n.hours[2].temp, 1e-9)
+        assertEquals("not in its unit: ignored", 80, n.hours[0].humidity)
+        assertEquals(20.0, n.hours[0].wind, 1e-9)
+        assertEquals(15 * 1.609344, n.hours[1].wind, 1e-9)
+        assertEquals("the grid's high", 15.0, n.days[0].max, 1e-9)
+        assertEquals("tonight's low, not the morning's leftover", 3.0, n.days[0].min, 1e-9)
+        assertEquals("no station: now is the first hour", 5.0, n.current.temp, 1e-9)
+    }
+
+    @Test
     fun nws() {
         val docs = nwsDocs()
         val n = Nws.parse(docs, 1795620600_000L)!!

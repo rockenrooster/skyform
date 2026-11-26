@@ -1,7 +1,8 @@
 # Skyform Weather — notes for Claude sessions
 
 Android weather app (Kotlin, Compose, no Play services), public at github.com/rockenrooster/skyform. Data:
-- the National Weather Service by default (`Nws.kt`: api.weather.gov forecasts, alerts, and the observation of the
+- the National Weather Service by default (`Nws.kt`: api.weather.gov forecasts, their numbers from the forecast grid
+  (`forecastGridData`, ahead of the hourly and 12-hour products after an update), alerts, and the observation of the
   nearest station, citizen (CWOP) ones included: the state's station list, kept 30 days; the hours start from its
   reading, the forecast's miss fading out over 6 hours; US only);
 - Open-Meteo (`OpenMeteo` in `Model.kt`) filling the NWS's gaps (UV, sun times, rain and snow amounts, feels-like,

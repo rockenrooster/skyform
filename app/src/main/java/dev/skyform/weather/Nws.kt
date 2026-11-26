@@ -6,6 +6,7 @@ import kotlinx.coroutines.coroutineScope
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
+import java.time.Duration
 import java.time.LocalDate
 import java.time.OffsetDateTime
 import java.util.Locale
@@ -22,24 +23,52 @@ object Nws {
     private const val API = "https://api.weather.gov"
     private const val ACCEPT = "application/geo+json"
 
+    /** The forecast grid's series the hours and days use (the grid has ~60; only these are kept). */
+    private val GRID = listOf("temperature", "dewpoint", "relativeHumidity", "probabilityOfPrecipitation", "windSpeed",
+        "windDirection", "maxTemperature", "minTemperature")
+
     /**
-     * The raw documents for a place ("hourly", "daily", and when they come, "obs", "alerts"); throws outside the US.
-     * [dir] keeps the state's station list.
+     * The raw documents for a place ("hourly", "daily", and when they come, "grid", "obs", "alerts"); throws outside
+     * the US. [dir] keeps the state's station list.
      */
     suspend fun fetch(lat: Double, lon: Double, dir: File): Map<String, String> = coroutineScope {
         val ll = "%.4f,%.4f".format(Locale.US, lat, lon)
         val pt = JSONObject(get("$API/points/$ll")).getJSONObject("properties")
         val hourly = async { get(pt.getString("forecastHourly")) }
         val daily = async { get(pt.getString("forecast")) }
+        // The forecasters' grid: the hourly and 12-hour forecasts are made from it but lag it after an update (seen
+        // 2026-11-26: the grid had lowered an afternoon by 5-6 °F; the hourly kept the old numbers for 20+ minutes).
+        val grid = async {
+            runCatching {
+                val p = JSONObject(get(pt.getString("forecastGridData"))).getJSONObject("properties")
+                JSONObject().apply { GRID.forEach { k -> p.optJSONObject(k)?.let { put(k, it) } } }.toString()
+            }.getOrNull()
+        }
         val obs = async { runCatching { nearestObs(lat, lon, pt, dir) }.getOrNull() }
         val alerts = async { runCatching { get("$API/alerts/active?point=$ll") }.getOrNull() }
         buildMap {
             put("hourly", hourly.await())
             put("daily", daily.await())
+            grid.await()?.let { put("grid", it) }
             obs.await()?.let { put("obs", it) }
             alerts.await()?.let { put("alerts", it) }
         }
     }
+
+    /** A grid series ("2026-11-26T18:00:00+00:00/PT6H": 40) as (start, hours, value); none if missing or not in [unit]. */
+    private fun JSONObject?.runs(name: String, unit: String): List<Triple<Long, Int, Double>> {
+        val a = this?.optJSONObject(name)?.takeIf { it.str("uom").endsWith(unit) }?.optJSONArray("values") ?: return emptyList()
+        return (0 until a.length()).mapNotNull { i ->
+            val o = a.getJSONObject(i)
+            val v = o.optDouble("value", Double.NaN).takeIf { !it.isNaN() } ?: return@mapNotNull null
+            val (start, length) = o.getString("validTime").split('/')
+            Triple(epoch(start), Duration.parse(length).toHours().toInt(), v)
+        }
+    }
+
+    /** A grid series by the hour (epoch seconds). */
+    private fun JSONObject?.hourly(name: String, unit: String) =
+        runs(name, unit).flatMap { (s, n, v) -> (0 until n).map { s + it * 3600L to v } }.toMap()
 
     /**
      * The latest quality-checked observation from the nearest station that has a fresh one. The forecast point's own
@@ -115,15 +144,28 @@ object Nws {
         // now: the nearest station's observation when it is recent and has a temperature, else the first forecast hour
         val obs = docs.str("obs").takeIf { it.isNotEmpty() }?.let { JSONObject(it).getJSONObject("properties") }
             ?.takeIf { o -> fresh(o, fetchedAt / 1000) }
+        // The grid's numbers where it has them (it runs ahead of the hourly forecast); the sky icons stay the hourly's.
+        val g = docs.str("grid").takeIf { it.isNotEmpty() }?.let { runCatching { JSONObject(it) }.getOrNull() }
+        val gT = g.hourly("temperature", "degC")
+        val gDew = g.hourly("dewpoint", "degC")
+        val gRh = g.hourly("relativeHumidity", "percent")
+        val gPop = g.hourly("probabilityOfPrecipitation", "percent")
+        val gWind = g.hourly("windSpeed", "km_h-1")
+        val gDir = g.hourly("windDirection", "degree_(angle)")
+        val times = periods.map { epoch(it.getString("startTime")) }
+        val base = periods.mapIndexed { i, p -> gT[times[i]] ?: temp(p) }
         // A measured "now" is where the hours start, so the chart agrees with it: the forecast's miss fades out over
         // 6 hours. ponytail: a fixed fade; a morning inversion's miss clears faster than a stuck cold wedge's.
-        val miss = obs?.let { it.v("temperature") - temp(periods[0]) } ?: 0.0
+        val miss = obs?.let { it.v("temperature") - base[0] } ?: 0.0
         val hours = periods.mapIndexed { i, p ->
-            Hour(epoch(p.getString("startTime")), temp(p) + miss * (6 - i).coerceAtLeast(0) / 6,
-                p.v("relativeHumidity").r(), p.v("probabilityOfPrecipitation").r(),
-                code(p.str("icon")), p.optBoolean("isDaytime", true), Double.NaN, Double.NaN, p.v("dewpoint"),
-                wind(p.str("windSpeed")), 0.0, windDir = degrees(p.str("windDirection")))
+            val t = times[i]
+            Hour(t, base[i] + miss * (6 - i).coerceAtLeast(0) / 6,
+                (gRh[t] ?: p.v("relativeHumidity")).r(), (gPop[t] ?: p.v("probabilityOfPrecipitation")).r(),
+                code(p.str("icon")), p.optBoolean("isDaytime", true), Double.NaN, Double.NaN, gDew[t] ?: p.v("dewpoint"),
+                gWind[t] ?: wind(p.str("windSpeed")), 0.0, windDir = gDir[t]?.roundToInt() ?: degrees(p.str("windDirection")))
         }
+        val gMax = g.runs("maxTemperature", "degC")
+        val gMin = g.runs("minTemperature", "degC")
 
         // 12-hour periods: each date's day period gives the high, the night after it the low (as the NWS pairs them)
         val days = docs.str("daily").takeIf { it.isNotEmpty() }?.let { JSONObject(it).getJSONObject("properties").getJSONArray("periods") }
@@ -138,8 +180,11 @@ object Nws {
                 val main = day ?: night!!
                 // the high and low take in the date's own hours too: after midnight, the night ahead is not today's low
                 fun pick(a: Double, b: Double, f: (Double, Double) -> Double) = if (a.isNaN()) b else if (b.isNaN()) a else f(a, b)
-                Day(start, code(main.str("icon")), pick(day?.let(::temp) ?: Double.NaN, own.maxOfOrNull { it.temp } ?: Double.NaN, ::maxOf),
-                    pick(night?.let(::temp) ?: Double.NaN, own.minOfOrNull { it.temp } ?: Double.NaN, ::minOf),
+                // the grid's: the last to start on this date (the morning's leftover low comes first, tonight's last)
+                fun grid(r: List<Triple<Long, Int, Double>>) = r.lastOrNull { it.first in start until start + 86400 }?.third
+                Day(start, code(main.str("icon")),
+                    pick(grid(gMax) ?: day?.let(::temp) ?: Double.NaN, own.maxOfOrNull { it.temp } ?: Double.NaN, ::maxOf),
+                    pick(grid(gMin) ?: night?.let(::temp) ?: Double.NaN, own.minOfOrNull { it.temp } ?: Double.NaN, ::minOf),
                     ps.maxOf { it.v("probabilityOfPrecipitation").r() },
                     0.0, 0, 0, Double.NaN, ps.maxOf { wind(it.str("windSpeed")) }, main.str("shortForecast"),
                     ps.joinToString("\n\n") { "${it.str("name")}: ${it.str("detailedForecast")}" })
