@@ -38,6 +38,8 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -287,8 +289,12 @@ private fun Page(p: Place, fc: Forecast?, u: Units, cards: List<Pair<Card, Boole
     val scope = rememberCoroutineScope()
     var pulled by remember { mutableStateOf(false) }
     val pull: () -> Unit = { if (!pulled) scope.launch { pulled = true; try { onRefresh() } finally { pulled = false } } }
+    // Pull distance that refreshes: the finger travels twice it, plus the touch slop. Material's 80 dp meant a ~168 dp drag
+    // (too stiff); 32 dp is ~72 dp. The spinner still travels 40 dp, so it is fully in view when the pull fires.
+    val pullState = rememberPullToRefreshState()
     // its own render node: sliding the page moves the node instead of re-recording everything on it each frame
-    PullToRefreshBox(pulled, pull, Modifier.fillMaxSize().graphicsLayer()) {
+    PullToRefreshBox(pulled, pull, Modifier.fillMaxSize().graphicsLayer(), state = pullState, threshold = 32.dp,
+        indicator = { PullToRefreshDefaults.Indicator(pullState, pulled, Modifier.align(Alignment.TopCenter), maxDistance = 40.dp) }) {
         val bottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
         // A plain scrolling column, not a lazy list: the cards are built once (a lazy list rebuilt them each time a
         // page slid back into view: about 11 ms in one frame)
