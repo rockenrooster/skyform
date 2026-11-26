@@ -80,6 +80,7 @@ import dev.skyform.weather.Units
 import dev.skyform.weather.Wmo
 import dev.skyform.weather.app
 import dev.skyform.weather.update.UpdateUi
+import dev.skyform.weather.widget.Widget
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
@@ -194,7 +195,11 @@ fun SkyformApp() {
                         traced("SF page $page") {
                             val p = places[page]
                             Page(p, forecastOf(p.id), units, cards, errors[p.id], onDay = { day = p.id to it }) {
-                                if (p.gps) repo.locate() else repo.refresh(p, 0)
+                                // A pull always fetches, at once, for the spot we have. "My location" then checks in the
+                                // background whether the phone has moved (a new spot fetches again): waiting for a fix first
+                                // held the spinner up to 15 s, and then kept any forecast under 15 minutes old.
+                                repo.refresh(p, 0)
+                                if (p.gps) app.scope.launch { repo.locate() }
                             }
                         }
                     }
@@ -241,7 +246,8 @@ private fun TopBar(place: Place?, fc: Forecast?, page: Int, count: Int, updating
                 Text(place?.name ?: "", fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Color.White, maxLines = 1,
                     overflow = TextOverflow.Ellipsis)
             }
-            val sub = listOfNotNull(place?.detail?.takeIf { it.isNotBlank() && !place.gps }, if (updating) "Updating…" else fc?.let { updated(it) }).joinToString(" · ")
+            val sub = listOfNotNull(place?.detail?.takeIf { it.isNotBlank() && !place.gps },
+                if (updating) "Updating…" else Widget.updated(LocalContext.current, fc).ifEmpty { null }).joinToString(" · ")
             if (sub.isNotEmpty()) Text(sub, fontSize = 12.sp, color = Dim, maxLines = 1, overflow = TextOverflow.Ellipsis)
             if (count > 1) Row(Modifier.padding(top = 5.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 repeat(count) { i ->
@@ -251,16 +257,6 @@ private fun TopBar(place: Place?, fc: Forecast?, page: Int, count: Int, updating
         }
         IconBtn(R.drawable.ic_share, "Share the weather", enabled = fc != null, onClick = onShare)
         IconBtn(R.drawable.ic_settings, "Settings", onClick = onSettings)
-    }
-}
-
-private fun updated(fc: Forecast): String {
-    val min = ((System.currentTimeMillis() - fc.fetchedAt) / 60_000).toInt()
-    return when {
-        min < 1 -> "Updated just now"
-        min < 60 -> "Updated $min min ago"
-        min < 60 * 24 -> "Updated ${min / 60} h ago"
-        else -> "Updated ${min / 1440} d ago"
     }
 }
 

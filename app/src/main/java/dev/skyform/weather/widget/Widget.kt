@@ -120,7 +120,8 @@ object Widget {
     private fun placeName(p: Place?) = p?.let { if (it.gps && it.detail.isNotBlank()) it.detail else it.name } ?: "Open Skyform to choose a place"
 
     /** "Updated 5:20 PM" in the phone's clock format; the day too when it is older than most of a day. */
-    private fun updated(c: Context, fc: Forecast?): String {
+    /** "Updated 5:20 PM" ("Updated Tue 5:20 PM" when older than 20 h): never stale, unlike "N min ago". Also the app's top bar. */
+    fun updated(c: Context, fc: Forecast?): String {
         fc ?: return ""
         val d = Date(fc.fetchedAt)
         val time = DateFormat.getTimeFormat(c).format(d)
